@@ -1,0 +1,7 @@
+# Development-only files — excluded from registry archive
+.gitignore
+.vscode/
+.idea/
+tests/
+*.psd
+*.ai
