@@ -13,6 +13,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+from PIL import Image
 
 import folder_paths
 
@@ -36,6 +37,9 @@ _CODEC_CONTAINERS = {
     "VP9": ("webm", "mkv"),
     "AV1": ("webm", "mkv"),
 }
+_AUDIO_CODEC_OPTIONS = ["Auto", "AAC", "Opus", "MP3"]
+_AUDIO_ENCODERS = {"AAC": "aac", "Opus": "libopus", "MP3": "libmp3lame"}
+_AUDIO_BITRATE_OPTIONS = ["64k", "96k", "128k", "160k", "192k", "256k", "320k"]
 
 
 def _expand_filename_macros(prefix):
@@ -85,6 +89,12 @@ def _pick_encoder(ffmpeg, codec):
             return candidate
     # Probe may fail (e.g. ffmpeg missing -encoders support); fall back to software.
     return _ENCODER_CANDIDATES[codec][-1]
+
+
+def _audio_encoder(audio_codec, container):
+    if audio_codec == "Auto":
+        return "libopus" if container == "webm" else "aac"
+    return _AUDIO_ENCODERS[audio_codec]
 
 
 def _resolve_save_path(filename_prefix, output_dir, width, height):
@@ -150,11 +160,39 @@ def _write_audio_wav(audio):
     return handle.name, duration
 
 
-def _frames_to_rgb_bytes(images, pingpong):
-    frames = images[..., :3].detach().to(device="cpu", dtype=torch.float32).clamp_(0, 1)
-    if pingpong and len(frames) >= 3:
-        frames = torch.cat((frames, frames[1:-1].flip(0)), dim=0)
-    return torch.round(frames * 255).to(torch.uint8).numpy().tobytes()
+def _pingpong_frames(images, pingpong):
+    if not pingpong or len(images) < 3:
+        return images
+    return torch.cat((images, images[1:-1].flip(0)), dim=0)
+
+
+def _frames_to_rgb_bytes(frames):
+    rgb = frames[..., :3].detach().to(device="cpu", dtype=torch.float32).clamp_(0, 1)
+    return torch.round(rgb * 255).to(torch.uint8).numpy().tobytes()
+
+
+def _export_edge_frames(images, output_path, save_first_frame, save_last_frame, pingpong):
+    """Write the first and/or last source frame as a PNG beside the encoded video."""
+    exports = []
+    if not save_first_frame and not save_last_frame:
+        return exports
+
+    base_path = os.path.splitext(output_path)[0]
+
+    def _write_png(frame, suffix):
+        rgb = frame[..., :3].detach().to(device="cpu", dtype=torch.float32).clamp_(0, 1)
+        pixels = torch.round(rgb * 255).to(torch.uint8).numpy()
+        path = f"{base_path}_{suffix}.png"
+        Image.fromarray(pixels, mode="RGB").save(path, "PNG")
+        exports.append(path)
+
+    if save_first_frame:
+        _write_png(images[0], "first")
+    if save_last_frame:
+        last_index = 1 if (pingpong and len(images) >= 3) else -1
+        _write_png(images[last_index], "last")
+
+    return exports
 
 
 class ChillEnhancedVideoCombine:
@@ -173,7 +211,7 @@ class ChillEnhancedVideoCombine:
                 "container": (["mp4", "webm", "mkv"], {"default": "mp4"}),
                 "quality": (
                     "INT",
-                    {"default": 23, "min": 0, "max": 51, "description": "FFmpeg CRF. Lower = higher quality/larger file."},
+                    {"default": 20, "min": 0, "max": 51, "description": "FFmpeg CRF. Lower = higher quality/larger file."},
                 ),
                 "pingpong": ("BOOLEAN", {"default": False}),
                 "save_metadata": (
@@ -182,6 +220,7 @@ class ChillEnhancedVideoCombine:
                 ),
                 "filename_prefix": ("STRING", {"default": "video/%date:yyyy-MM-dd%/Chill_%date:hhmmss%"}),
                 "save_output": ("BOOLEAN", {"default": True}),
+                "pass_frames": ("BOOLEAN", {"default": False, "description": "Return the encoded frame sequence for downstream processing."}),
             },
             "optional": {
                 "audio": ("AUDIO",),
@@ -189,12 +228,16 @@ class ChillEnhancedVideoCombine:
                     "BOOLEAN",
                     {"default": False, "description": "End the video at the audio's duration."},
                 ),
+                "audio_codec": (_AUDIO_CODEC_OPTIONS, {"default": "Auto"}),
+                "audio_bitrate": (_AUDIO_BITRATE_OPTIONS, {"default": "192k"}),
+                "save_first_frame": ("BOOLEAN", {"default": False, "description": "Write the first frame as a PNG beside the encoded video."}),
+                "save_last_frame": ("BOOLEAN", {"default": False, "description": "Write the last frame as a PNG beside the encoded video."}),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("filename",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("frames", "filename")
     FUNCTION = "combine"
     OUTPUT_NODE = True
     CATEGORY = "Chill/Video"
@@ -214,8 +257,13 @@ class ChillEnhancedVideoCombine:
         save_metadata,
         filename_prefix,
         save_output,
+        pass_frames,
         audio=None,
         crop_to_audio=False,
+        audio_codec="Auto",
+        audio_bitrate="192k",
+        save_first_frame=False,
+        save_last_frame=False,
         prompt=None,
         extra_pnginfo=None,
     ):
@@ -259,7 +307,7 @@ class ChillEnhancedVideoCombine:
         command += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(frame_rate), "-i", "-"]
         if audio_path:
             command += ["-i", audio_path]
-            command += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
+            command += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", _audio_encoder(audio_codec, container), "-b:a", audio_bitrate]
             if crop_to_audio and audio_duration:
                 command += ["-t", f"{audio_duration:.6f}"]
         command += ["-c:v", encoder, "-crf", str(quality), "-pix_fmt", "yuv420p"]
@@ -267,8 +315,9 @@ class ChillEnhancedVideoCombine:
             command += ["-movflags", "+faststart"]
         command += [output_path]
 
-        frame_bytes = _frames_to_rgb_bytes(images, pingpong)
-        num_encoded_frames = len(images) + (len(images) - 2 if pingpong and len(images) >= 3 else 0)
+        pingponged = _pingpong_frames(images, pingpong)
+        frame_bytes = _frames_to_rgb_bytes(pingponged)
+        num_encoded_frames = len(pingponged)
         progress_bar = comfy.utils.ProgressBar(num_encoded_frames) if comfy is not None else None
 
         try:
@@ -294,17 +343,30 @@ class ChillEnhancedVideoCombine:
             with open(sidecar_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f)
 
-        print(f"ChillEnhancedVideoCombine: Saved {output_path} ({codec} via {encoder}, {container})")
+        frame_exports = _export_edge_frames(images, output_path, save_first_frame, save_last_frame, pingpong)
 
-        results = [
+        print(f"ChillEnhancedVideoCombine: Saved {output_path} ({codec} via {encoder}, {container})")
+        for path in frame_exports:
+            print(f"ChillEnhancedVideoCombine: Frame export {path}")
+
+        assets = [
             {
                 "filename": file_name,
                 "subfolder": subfolder,
                 "type": output_type,
                 "format": _CONTAINER_MIME[container],
+                "width": width,
+                "height": height,
+                "fps": frame_rate,
             }
         ]
-        return {"ui": {"gifs": results}, "result": (output_path,)}
+        assets.extend(
+            {"filename": os.path.basename(path), "subfolder": subfolder, "type": output_type, "format": "image/png"}
+            for path in frame_exports
+        )
+
+        output_frames = pingponged if pass_frames else images[:0]
+        return {"ui": {"gifs": assets}, "result": (output_frames, output_path)}
 
 
 # Node registration
