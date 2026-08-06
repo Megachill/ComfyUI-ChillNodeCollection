@@ -1,7 +1,7 @@
 [project]
 name = "chillnodecollection"
 description = "A collection of enhanced ComfyUI nodes: multi-format image saving with quality control, GPS EXIF metadata and date macros, and FFmpeg-based video combining with GPU encoder auto-detection."
-version = "1.0.0"
+version = "1.0.1"
 license = "MIT"
 classifiers = [
     "Operating System :: OS Independent",
